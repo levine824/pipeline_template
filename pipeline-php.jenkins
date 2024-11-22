@@ -1,0 +1,588 @@
+import java.util.*;
+import java.text.SimpleDateFormat;
+//  #####################     pipeline init read config     ####################
+def Properties readAllConfig(cfgfilepath){
+
+        String remotefileC = readFile  encoding: 'UTF-8', file:  cfgfilepath
+        
+		Properties myP = new Properties();
+		try {
+    		myP.load(new StringReader(remotefileC))
+		}catch(IOException e){
+			echo "ERROR: 读取配置异常 " + e
+			return myP;
+		}
+		return myP
+}
+
+def String getOneConfig(Properties myP , String queryKey){
+	if (myP.getProperty(queryKey) != null) {
+		return myP.getProperty(queryKey).replaceAll("^\"|\"\$", "")
+	} else {
+		throw new Exception ("ERROR：配置" + queryKey + "不存在！ " )
+	}
+}
+//  ###########################        send MQ msg         ###########################
+// createMQBody
+def createMQBody(stage_name,build_id,status,msg){
+    // flag: 
+    // 0 -> 成功
+    // 1 -> 失败
+    return '{ "taskName":"'+ stage_name +'" , "buildNum":"' + build_id + '" , "buildEndFlag":"' + status +'" , "buildErrorMsg":"' + msg  + '"}'
+}
+// sendMQ
+def sendMQ(status) {
+
+    MQName = "${STAGE_NAME}"
+    
+    // MQBody 
+    if (status == "success") {
+        Msg=""
+        MQBody = createMQBody(JOB_NAME,BUILD_ID,0,Msg)
+    }else {
+        Msg="${STAGE_NAME}" + " 失败"
+        MQBody = createMQBody(JOB_NAME,BUILD_ID,1,Msg)
+    }
+
+    // 发送 MQ
+    if (stage_name == "INIT") {
+        sh "python ./scripts/RMQProducer.py ${MQIP} ${MQPort} ${MQUser} ${MQPwd} ${MQLevel}  ${MQName} '${MQBody}' "
+    } else {
+        sh "python ${JOB_NAME}/scripts/RMQProducer.py ${MQIP} ${MQPort} ${MQUser} ${MQPwd} ${MQLevel}  ${MQName} '${MQBody}' "
+    }
+
+}
+// #####################    发送 packageName to MQ      ###############################
+def sendMQForPackage(status,packagename) {
+
+    MQName = "${STAGE_NAME}"
+    
+    // MQBody 
+    if (status == "success") {
+        if (stage_name == "PACKAGE") {
+            Msg=packagename
+        }else {
+            Msg=""
+        }
+        
+        MQBody = createMQBody(JOB_NAME,BUILD_ID,0,Msg)
+    }else {
+        Msg="${STAGE_NAME}" + " 失败"
+        MQBody = createMQBody(JOB_NAME,BUILD_ID,1,Msg)
+    }
+
+    // 发送 MQ
+ 
+    sh "python ${JOB_NAME}/scripts/RMQProducer.py ${MQIP} ${MQPort} ${MQUser} ${MQPwd} ${MQLevel}  ${MQName} '${MQBody}' "
+
+}
+
+// #####################    获取当前时间戳      ##############################
+
+def today(){
+    String str = "";
+    SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdHHmmss");
+    Calendar lastDate = Calendar.getInstance();
+    lastDate.add(Calendar.MINUTE, 2);
+    str = sdf.format(lastDate.getTime());
+    return str;
+}
+//  ###################     获取带时间戳的 packageName      #################
+def String getPackageName(String packagename) {
+
+    String dateNew = today()
+
+    str = packagename.split("\\.tar.gz|\\.apk|\\.ipa").toList()
+    
+    if (packagename.matches("(.*)-[0-9]{14}.(.*)") ){
+			return packagename
+	}
+    
+    if (packagename.endsWith(".tar.gz")) {
+        packagename = str[0] + "-" + dateNew + ".tar.gz"
+    }
+
+    if (packagename.endsWith(".apk")) {
+        packagename = str[0] + "-" + dateNew + ".apk"
+    }
+
+    if (packagename.endsWith(".ipa")) {
+        packagename = str[0] + "-" + dateNew + ".ipa"
+    }
+ 
+    return packagename
+}
+
+// ####################################################################################
+pipeline {
+    
+    // 默认agent 
+    agent none
+
+    // 下面这个 label 值可以为  node name
+    // agent {
+        // label "${LABEL}"
+       // label 'dev_build'
+    // }
+    // agent {
+    //    node {
+    //        label 'dev_build'
+    //    }
+    // }
+
+
+    // jenkins 参数设置
+    options {
+        timestamps()
+        // 在agent指令中默认跳过来自源代码控制的代码
+        skipDefaultCheckout() 
+        // 设置Pipeline运行的超时时间
+        timeout(time: 1, unit: 'HOURS')  
+        // 失败后，重试整个Pipeline的次数
+        // retry(1)  
+        // 构建历史设置
+        buildDiscarder(logRotator(daysToKeepStr: '30', numToKeepStr: '90')) 
+    }
+    // 定时触发任务
+    // triggers {
+    //     cron('H 4/* 0 0 1-5')  // 或  pollSCM('H 4/* 0 0 1-5')
+    // }
+
+    // 环境变量
+    environment {        
+        // init config info
+       //INIT_IMAGE="harbor.zznode.com/public/code:0.1"
+		INIT_IMAGE="${params.INIT_IMAGE}"
+        CONFIG_URL="${params.CONFIG_URL}"
+        CONFIG_PATH="config.properties"
+        CONFIG_CERT_ID="001"
+        
+        FTP_DEST="${params.FTP_DEST}"
+        FTP_HOST="${params.FTP_HOST}"
+        FTP_USER="${params.FTP_USER}"
+        FTP_PASSWORD="${params.FTP_PASSWORD}"
+        // 将PACKAGE_NAME 加上时间戳
+        PACKAGE_NAME=getPackageName("${params.PACKAGE_NAME}")
+        PACKAGE_CMD="${params.PACKAGE_CMD}"
+
+        PACKAGE_NAME="${params.PACKAGE_NAME}"
+
+        LABEL="${params.LABEL}"
+
+        COMMIT_ID="${params.COMMIT_ID}"
+    }
+
+    stages {
+        // 0. 配置初始化
+        stage('INIT') {
+            agent {
+                docker {
+                    label "${LABEL}"
+                    image "${INIT_IMAGE}"
+                }
+            }
+            // steps
+            steps {
+                script {
+                    checkout([$class: "SubversionSCM", additionalCredentials: [], excludedCommitMessages: "", excludedRegions: "", excludedRevprop: "", excludedUsers: "", filterChangelog: false, ignoreDirPropChanges: false, includedRegions: "", locations: [[cancelProcessOnExternalsFail: true, credentialsId: "${CONFIG_CERT_ID}", depthOption: "infinity", ignoreExternalsOption: true, local: ".", remote: "${CONFIG_URL}"]], quietOperation: true, workspaceUpdater: [$class: "UpdateWithRevertUpdater"]])
+                    
+                    cfg=readAllConfig(CONFIG_PATH)
+
+                    // MQ_INFO
+                    MQIP=getOneConfig(cfg,"MQIP")
+                    MQPort=getOneConfig(cfg,"MQPort")
+                    MQUser=getOneConfig(cfg,"MQUser")
+                    MQPwd=getOneConfig(cfg,"MQPwd")
+                    MQLevel=getOneConfig(cfg,"MQLevel")
+                    //flag
+                    CHECKOUT_FLAG=getOneConfig(cfg,"CHECKOUT_FLAG")
+                    TEST_FLAG=getOneConfig(cfg,"TEST_FLAG")
+                    SCAN_FLAG=getOneConfig(cfg,"SCAN_FLAG")
+                    UPLOAD_FLAG=getOneConfig(cfg,"UPLOAD_FLAG")
+                    DEPLOY_FLAG=getOneConfig(cfg,"DEPLOY_FLAG")
+                    AUTO_TEST_FLAG=getOneConfig(cfg,"AUTO_TEST_FLAG")
+                    // code
+                    GIT_BRANCH=getOneConfig(cfg,"GIT_BRANCH")
+                    CERT_ID=getOneConfig(cfg,"CERT_ID")
+                    CODE_URL=getOneConfig(cfg,"CODE_URL")
+                    CODE_TYPE=getOneConfig(cfg,"CODE_TYPE")
+                    CODE_IMAGE=getOneConfig(cfg,"CODE_IMAGE")
+
+                    SVN_USER=getOneConfig(cfg,"SVN_USER")
+                    SVN_PASSWORD=getOneConfig(cfg,"SVN_PASSWORD")
+                            
+                    // code-scan
+                    SCAN_IMAGE=getOneConfig(cfg,"SCAN_IMAGE")
+                    // SCAN_CMD=getOneConfig(cfg,"SCAN_CMD")
+
+                    // test
+                    TEST_IMAGE=getOneConfig(cfg,"TEST_IMAGE")
+                    TEST_CMD=getOneConfig(cfg,"TEST_CMD")
+                    // upload
+                    UPLOAD_IMAGE=getOneConfig(cfg,"UPLOAD_IMAGE")
+                    ARTIFACT_FILE_TYPE=getOneConfig(cfg,"ARTIFACT_FILE_TYPE")
+                    // harbor
+                    DOCKER_TAG=getOneConfig(cfg,"DOCKER_TAG")
+                    HARBOR_USER=getOneConfig(cfg,"HARBOR_USER")
+                    HARBOR_PASSWORD=getOneConfig(cfg,"HARBOR_PASSWORD")
+                    // ftp
+                    // FTP_HOST=getOneConfig(cfg,"FTP_HOST")
+                    // FTP_USER=getOneConfig(cfg,"FTP_USER")
+                    // FTP_PASSWORD=getOneConfig(cfg,"FTP_PASSWORD")
+                    // FTP_DEST=getOneConfig(cfg,"FTP_DEST")
+                    FTP_SRC=getOneConfig(cfg,"FTP_SRC")
+
+                    // deploy
+                    DEPLOY_IMAGE=getOneConfig(cfg,"DEPLOY_IMAGE")
+                    REMOTE_DIR=getOneConfig(cfg,"REMOTE_DIR")
+
+                    PACKAGE_LIST=getOneConfig(cfg,"PACKAGE_LIST")
+                    PACKAGE_DIR=getOneConfig(cfg,"PACKAGE_DIR")
+
+                    BACKUP_DIR=getOneConfig(cfg,"BACKUP_DIR")
+                    SCRIPT_PATH="./${JOB_NAME}/scripts"
+
+                    // auto test
+                    AUTO_TEST_IMAGE=getOneConfig(cfg,"AUTO_TEST_IMAGE")
+                    AUTO_TEST_CMD=getOneConfig(cfg,"AUTO_TEST_CMD")
+                    // FINAL
+                    FINAL_IMAGE=getOneConfig(cfg,"FINAL_IMAGE")
+
+                    // LABEL
+                    //LABEL=getOneConfig(cfg,"LABEL")
+
+                    // k8s info
+                    K8S_CONFIG_NAME=getOneConfig(cfg,"K8S_CONFIG_NAME")
+                    K8S_NAMESPACE=getOneConfig(cfg,"K8S_NAMESPACE")
+                }   
+            }
+            post {
+                success {
+                    script {
+                        sh "svn co --username ${SVN_USER} --password ${SVN_PASSWORD} --no-auth-cache ${CONFIG_URL}"
+                        sendMQ("success")
+                    }
+                }
+                failure {
+                    script {
+                        sendMQ("faild")
+                    }
+                }
+            }         
+
+        }
+        // 1. 代码检出
+        // svn co --username admin --password 123456 --no-auth-cache svn://10.2.6.79/zznode/devops
+        stage('CHECK_OUT'){
+            // 执行开关
+            when { 
+                expression {
+                    return (CHECKOUT_FLAG == "true" )
+                }
+            }
+            // agent
+            agent {
+                docker {
+                    label "${LABEL}"
+                    image "${CODE_IMAGE}"
+                }
+            }
+            // steps
+            steps {
+                script {
+                    
+                    if ( CODE_TYPE == 'git' ) {
+                        checkout([$class: "GitSCM", branches: [[name: "${GIT_BRANCH}"]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: "CleanBeforeCheckout", deleteUntrackedNestedRepositories: true]], submoduleCfg: [], userRemoteConfigs: [[credentialsId: "${CERT_ID}", url: "$CODE_URL"]]])
+                    } 
+					if (( CODE_TYPE == 'svn' ) && ( COMMIT_ID == ' ' )) {
+                        checkout([$class: "SubversionSCM", additionalCredentials: [], excludedCommitMessages: "", excludedRegions: "", excludedRevprop: "", excludedUsers: "", filterChangelog: false, ignoreDirPropChanges: false, includedRegions: "", locations: [[cancelProcessOnExternalsFail: true, credentialsId: "${CERT_ID}", depthOption: "infinity", ignoreExternalsOption: true, local: ".", remote: "${CODE_URL}"]], quietOperation: true, workspaceUpdater: [$class: "UpdateWithRevertUpdater"]])
+                    }
+					if (( CODE_TYPE == 'svn' ) && ( COMMIT_ID != ' ' )) {
+                        checkout([$class: "SubversionSCM", additionalCredentials: [], excludedCommitMessages: "", excludedRegions: "", excludedRevprop: "", excludedUsers: "", filterChangelog: false, ignoreDirPropChanges: false, includedRegions: "", locations: [[cancelProcessOnExternalsFail: true, credentialsId: "${CERT_ID}", depthOption: "infinity", ignoreExternalsOption: true, local: ".", remote: "${CODE_URL}@${COMMIT_ID}"]], quietOperation: true, workspaceUpdater: [$class: "UpdateWithRevertUpdater"]])
+                    }
+                }
+            }
+            // 发送执行通知
+            post {
+                success {
+                    script {
+                        sh "svn co --username ${SVN_USER} --password ${SVN_PASSWORD} --no-auth-cache ${CONFIG_URL}"
+                        
+                        // git commit_id
+                        if ( CODE_TYPE == 'git' ) {
+                            sh "git reset --hard ${COMMIT_ID}"
+                        }
+
+                        sendMQ("success")
+                    }
+                }
+                failure {
+                    script {
+                        sendMQ("faild")
+                    }
+                }
+            }
+        } 
+
+        // 2. 单元测试
+        stage('TEST') {
+            // 执行开关
+            when { 
+                // environment name: 'TEST_FLAG', 
+                // value: 'true' 
+                expression {
+                    return (TEST_FLAG == "true" )
+                }
+            }
+            // agent
+            agent {
+                docker {
+                    label "${LABEL}"
+                    image "${TEST_IMAGE}"
+                }
+            }
+            // steps
+            steps {
+                sh "${TEST_CMD}" 
+            }
+            // stage post
+            post {
+                //将JUnit步骤放在post always中 当测试环境不通过时, 在jenkins的状态页面依然可以收集到测试报告,显示出测试结果趋势图.
+                // always {
+                //     junit "target/surefire-reports/*.xml"
+                // }
+
+                success {
+                    script {
+                        sendMQ("success")
+                    }
+                }
+                failure {
+                    script {
+                        sendMQ("faild")
+                    }
+                }
+            }
+
+        }
+        
+        // 3. 代码扫描
+        stage('SCAN_CODE') {
+            // 执行开关
+            when { 
+                expression {
+                    return (SCAN_FLAG == "true" )
+                }
+            }
+            // agent
+            agent {
+                docker {
+                    label "${LABEL}"
+                    image "${SCAN_IMAGE}"
+                }
+            }
+            // steps
+            steps {
+                script {
+                    sh "cp ${JOB_NAME}/sonar-scanner/sonar-project.properties ./sonar-project.properties"
+
+                    sh "sonar-scanner"
+                }
+                
+                
+            }
+            // 发送执行通知
+            post {
+                success {
+                    script {
+                        sendMQ("success")
+                    }
+                }
+                failure {
+                    script {
+                        sendMQ("faild")
+                    }
+                }
+            }
+
+        }
+
+        // 4. 上传包到制品库
+        stage('PACKAGE') {
+            // 执行开关
+            when { 
+                expression {
+                    return (UPLOAD_FLAG == "true" )
+                }
+            }
+            // agent
+            agent {
+                docker {
+                    label "${LABEL}"
+                    image "${UPLOAD_IMAGE}"
+                }
+            }
+
+            // steps
+            steps {
+                script {
+                    if ( ARTIFACT_FILE_TYPE == "nexus" ) {
+                        sh "${PACKAGE_CMD}"
+                    }
+
+                    if ( ARTIFACT_FILE_TYPE == "ftp" ) {
+                        // 打成tar.gz 包
+                        sh "cd ${PACKAGE_DIR}; tar -zcvf ${PACKAGE_NAME}  ${PACKAGE_LIST} "
+
+                        // 上传
+                        sh "lftp ${FTP_HOST} -u ${FTP_USER},${FTP_PASSWORD} -e 'cd ${FTP_DEST};lcd ${PACKAGE_DIR};put ${PACKAGE_NAME};bye' "
+                    }
+                    if ( ARTIFACT_FILE_TYPE == "harbor" ) {
+                        
+                        sh "docker login -u ${HARBOR_USER}  -p ${HARBOR_PASSWORD} ${DOCKER_TAG}"
+                        sh "docker build -t ${DOCKER_TAG} ."
+                        sh "docker push ${DOCKER_TAG}"
+                    }
+                }
+                  
+            }
+
+            // 发送执行通知
+            post {
+                success {
+                    script {
+                       sendMQForPackage("success",PACKAGE_NAME)
+                    }
+                }
+                failure {
+                    script {
+                        sendMQ("faild")
+                    }
+                }
+            }
+        }
+        
+        // 5. deploy
+        stage('DEPLOY') {
+            // 执行开关
+            when { 
+                expression {
+                    return (DEPLOY_FLAG == "true" )
+                }
+            }
+            // agent
+            agent {
+                docker {
+                    label "${LABEL}"
+                    image "${DEPLOY_IMAGE}"
+                    args "-v ${JENKINS_HOME}/workspace/${JOB_NAME}/${JOB_NAME}/k8s/login/${K8S_CONFIG_NAME}:/etc/kubernetes/admin.conf -v ${JENKINS_HOME}/workspace/${JOB_NAME}/${JOB_NAME}/ansible/ansible.cfg:/etc/ansible/ansible.cfg  -v ${BACKUP_SQL_PATH}:/opt"
+                }
+            }
+            // step
+            steps {
+                script {
+
+                    // k8s 
+                    if ((ARTIFACT_FILE_TYPE == "harbor" ) && (DEPLOY_TYPE == "k8s")) {
+                        sh "kubectl --insecure-skip-tls-verify=true apply -f ./${JOB_NAME}/k8s/app.yaml -n ${K8S_NAMESPACE}"
+                    }
+
+                sh "ansible-playbook -i ./${JOB_NAME}/ansible/hosts \
+                    ./${JOB_NAME}/ansible/deploy.yml \
+                    -e PACKAGE_NAME=${PACKAGE_NAME} \
+                    -e REMOTE_DIR=${REMOTE_DIR} \
+                    -e TARGET=target \
+                    -e SCRIPT_PATH=${SCRIPT_PATH} \
+                    -e FTP_USER=${FTP_USER} \
+                    -e FTP_PASSWORD=${FTP_PASSWORD} \
+                    -e FTP_HOST=${FTP_HOST} \
+                    -e FTP_DEST=${FTP_DEST} \
+                    -e LOCAL_SCRIPT_DIR=${WORKSPACE}/${JOB_NAME}/scripts \
+                    -e BACKUP_DIR=${BACKUP_DIR} "
+                }
+            }
+
+            // 发送执行通知
+            post {
+                success {
+                    script {
+                        sendMQ("success")
+                    }
+                }
+                failure {
+                    script {
+                        sendMQ("faild")
+                    }
+                }
+            }
+        }
+        // 6. 自动化测试
+        stage('AUTO_TEST') {
+            // 执行开关
+            when { 
+                expression {
+                    return (AUTO_TEST_FLAG == "true" )
+                }
+            }
+            // agent
+            agent {
+                docker {
+                    label "${LABEL}"
+                    image "${AUTO_TEST_IMAGE}"
+                    args '-v /root/.m2:/root/.m2'
+                }
+            }
+            // step
+            steps {
+                sh 'echo "auto test ..."'
+            }
+
+            // 发送执行通知
+            post {
+                success {
+                    script {
+                        sendMQ("success")
+                    }
+                }
+                failure {
+                    script {
+                        sendMQ("faild")
+                    }
+                }
+            }
+        }
+
+        // 7. final 阶段(必须执行), 只用于发送MQ通知
+        stage('FINAL') {
+            // agent
+            agent {
+                docker {
+                    label "${LABEL}"
+                    image "${FINAL_IMAGE}"
+                }
+            }
+            // step
+            steps {
+                script {
+                    sh "echo final ......"
+                }
+                
+            }
+            // 发送执行通知
+            post {
+                success {
+                    script {
+                        sendMQ("success")
+                    }
+                }
+                failure {
+                    script {
+                        sendMQ("faild")
+                    }
+                }
+            }
+        }    
+    }
+
+
+}
